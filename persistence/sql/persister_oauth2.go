@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gofrs/uuid"
+	"github.com/ory/hydra/v2/flow"
 	"github.com/pkg/errors"
 	"github.com/tidwall/gjson"
 	"go.opentelemetry.io/otel/attribute"
@@ -626,6 +627,44 @@ func (p *Persister) DeleteAccessTokens(ctx context.Context, clientID string) (er
 	return sqlcon.HandleError(
 		p.QueryWithNetwork(ctx).Where("client_id=?", clientID).Delete(&OAuth2RequestSQL{Table: sqlTableAccess}),
 	)
+}
+
+func (p *Persister) DeleteSubjectAccessTokens(ctx context.Context, sub string) (err error) {
+	ctx, span := p.r.Tracer(ctx).Tracer().Start(ctx, "persistence.sql.DeleteSubjectAccessTokens",
+		trace.WithAttributes(events.Subject(sub)),
+	)
+	defer otelx.End(span, &err)
+
+	fs := make([]*flow.Flow, 0)
+	if err := p.QueryWithNetwork(ctx).
+		Where("consent_challenge_id IS NOT NULL AND subject = ?", sub).
+		Select("consent_challenge_id").
+		All(&fs); errors.Is(err, sql.ErrNoRows) {
+		return errors.WithStack(x.ErrNotFound)
+	} else if err != nil {
+		return sqlcon.HandleError(err)
+	}
+
+	ids := make([]interface{}, 0, len(fs))
+	nid := p.NetworkID(ctx)
+	for _, f := range fs {
+		ids = append(ids, f.ConsentRequestID.String())
+	}
+
+	if len(ids) == 0 {
+		return nil
+	}
+
+	if err := p.QueryWithNetwork(ctx).
+		Where("nid = ?", nid).
+		Where("request_id IN (?)", ids...).
+		Delete(OAuth2RequestSQL{Table: sqlTableAccess}.TableName()); errors.Is(err, fosite.ErrNotFound) {
+		// do nothing
+	} else if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func handleRetryError(err error) error {
